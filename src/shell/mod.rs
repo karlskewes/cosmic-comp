@@ -13,13 +13,18 @@ use wayland_backend::server::ClientId;
 
 use crate::{
     shell::{
-        element::CosmicStack, focus::FocusTarget, grabs::fullscreen_items,
-        layout::tiling::PlaceholderType,
+        element::CosmicStack,
+        focus::FocusTarget,
+        grabs::fullscreen_items,
+        layout::{WorkspaceAssignments, tiling::PlaceholderType},
     },
     utils,
     wayland::{
         handlers::data_device::{self, get_dnd_icon},
-        protocols::workspace::{State as WState, WorkspaceCapabilities},
+        protocols::{
+            session_lock_layer::layer_show_on_lock,
+            workspace::{State as WState, WorkspaceCapabilities},
+        },
     },
 };
 use cosmic_comp_config::{
@@ -29,10 +34,16 @@ use cosmic_comp_config::{
 use cosmic_config::ConfigSet;
 use cosmic_protocols::workspace::v2::server::zcosmic_workspace_handle_v2::TilingState;
 use cosmic_settings_config::shortcuts::action::{Direction, FocusDirection, ResizeDirection};
-use cosmic_settings_config::{shortcuts, window_rules::ApplicationException};
+use cosmic_settings_config::{
+    shortcuts,
+    window_rules::{ApplicationException, WorkspaceAssignment},
+};
 use keyframe::{ease, functions::EaseInOutCubic};
 use smithay::{
-    backend::{input::TouchSlot, renderer::element::RenderElementStates},
+    backend::{
+        input::{TabletToolDescriptor, TouchSlot},
+        renderer::element::RenderElementStates,
+    },
     desktop::{
         LayerSurface, PopupKind, WindowSurface, WindowSurfaceType, layer_map_for_output,
         space::SpaceElement,
@@ -46,6 +57,7 @@ use smithay::{
         pointer::{
             CursorImageStatus, CursorImageSurfaceData, Focus, GrabStartData as PointerGrabStartData,
         },
+        tablet::{TabletSeatTrait, tool::GrabTrigger as TabletGrabTrigger},
     },
     output::{Output, WeakOutput},
     reexports::{
@@ -67,6 +79,7 @@ use smithay::{
     xwayland::X11Surface,
 };
 use tracing::error;
+use tracing::warn;
 
 use crate::{
     backend::render::animations::spring::{Spring, SpringParams},
@@ -130,6 +143,7 @@ pub enum Trigger {
     KeyboardMove(shortcuts::Modifiers),
     Pointer(u32),
     Touch(TouchSlot),
+    Tool(TabletToolDescriptor, TabletGrabTrigger),
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +268,7 @@ pub struct PendingWindow {
     pub surface: CosmicSurface,
     pub seat: Seat<State>,
     pub fullscreen: Option<Output>,
+    pub minimized: bool,
     pub maximized: bool,
     pub sticky: bool,
 }
@@ -296,7 +311,7 @@ pub struct Shell {
     zoom_state: Option<ZoomState>,
     appearance_conf: AppearanceConfig,
     tiling_exceptions: TilingExceptions,
-
+    workspace_assignments: WorkspaceAssignments,
     #[cfg(feature = "debug")]
     pub debug_active: bool,
 }
@@ -1714,6 +1729,9 @@ impl Shell {
 
         let tiling_exceptions = layout::TilingExceptions::new(config.tiling_exceptions.iter());
 
+        let workspace_assignments =
+            layout::WorkspaceAssignments::new(config.workspace_assignments.iter());
+
         Shell {
             workspaces: Workspaces::new(config, theme.clone()),
             seats: Seats::new(),
@@ -1736,6 +1754,7 @@ impl Shell {
             appearance_conf: config.cosmic_conf.appearance_settings,
             zoom_state: None,
             tiling_exceptions,
+            workspace_assignments,
 
             #[cfg(feature = "debug")]
             debug_active: false,
@@ -1754,7 +1773,7 @@ impl Shell {
                 if let Some(set) = self.workspaces.sets.get_mut(output) {
                     if matches!(
                         self.overview_mode.active_trigger(),
-                        Some(Trigger::Pointer(_) | Trigger::Touch(_))
+                        Some(Trigger::Pointer(_) | Trigger::Touch(_) | Trigger::Tool(_, _))
                     ) {
                         set.workspaces[set.active].tiling_layer.cleanup_drag();
                     }
@@ -1805,7 +1824,7 @@ impl Shell {
                 if let Some(set) = self.workspaces.sets.get_mut(output) {
                     if matches!(
                         self.overview_mode.active_trigger(),
-                        Some(Trigger::Pointer(_) | Trigger::Touch(_))
+                        Some(Trigger::Pointer(_) | Trigger::Touch(_) | Trigger::Tool(_, _))
                     ) {
                         set.workspaces[set.active].tiling_layer.cleanup_drag();
                     }
@@ -2040,12 +2059,27 @@ impl Shell {
     }
 
     pub fn visible_output_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
+        // NOTE: Keep in sync with surface iteration in `render_input_order_internal`
+
         if let Some(session_lock) = &self.session_lock {
-            return session_lock
+            if let Some((output, _)) = session_lock
                 .surfaces
                 .iter()
                 .find(|(_, v)| v.wl_surface() == surface)
-                .map(|(k, _)| k);
+            {
+                return Some(output);
+            }
+            for o in self.outputs() {
+                let map = layer_map_for_output(o);
+                if let Some(layer_surface) = map.layer_for_surface(surface, WindowSurfaceType::ALL)
+                {
+                    if layer_show_on_lock(layer_surface.wl_surface()) {
+                        return Some(o);
+                    } else {
+                        return None;
+                    }
+                }
+            }
         }
 
         self.outputs()
@@ -2856,6 +2890,7 @@ impl Shell {
             surface: window,
             seat,
             fullscreen: output,
+            minimized: should_be_minimized,
             maximized: should_be_maximized,
             sticky: mut should_be_sticky,
         } = self.pending_windows.remove(pos);
@@ -2873,10 +2908,32 @@ impl Shell {
         };
 
         let pending_activation = self.pending_activations.remove(&(&window).into());
-        let workspace_handle = match pending_activation {
+        let mut workspace_handle = match pending_activation {
             Some(ActivationContext::Workspace(handle)) => Some(handle),
             _ => None,
         };
+
+        let pinned_workspace_name =
+            layout::get_workspace_assignment(&self.workspace_assignments, &window);
+
+        let pinned_workspace_handle = pinned_workspace_name //
+            .as_deref()
+            .and_then(|target_name| {
+                self.workspaces
+                    .spaces()
+                    .find(|ws| ws.name.as_deref() == Some(target_name))
+                    .map(|ws| ws.handle)
+            });
+
+        if let Some(name) = pinned_workspace_name
+            && pinned_workspace_handle.is_none()
+        {
+            warn!("Assigned workspace name not found: {}", name);
+        };
+
+        // override the pending activation handle if we have a matching pinned workspace.
+        // NOTE: if the pinned workspace is not active, it will not be made active.
+        workspace_handle = pinned_workspace_handle.or(workspace_handle);
 
         let should_be_fullscreen = output.is_some();
         let mut output = output.unwrap_or_else(|| seat.active_output());
@@ -2939,6 +2996,7 @@ impl Shell {
         if let Some(FocusTarget::Window(focused)) = maybe_focused
             && let Some(stack) = focused.stack_ref()
             && !is_dialog
+            && !should_be_minimized
             && !should_be_maximized
             && !(workspace.is_tiled(&focused.active_window()) && floating_exception)
         {
@@ -2988,8 +3046,13 @@ impl Shell {
             self.maximize_request(&mapped, &seat, false, loop_handle);
         }
 
-        let new_target = if (workspace_output == seat.active_output()
-            && active_handle == workspace_handle)
+        if should_be_minimized {
+            self.minimize_request(&window);
+        }
+
+        let new_target = if should_be_minimized {
+            None
+        } else if (workspace_output == seat.active_output() && active_handle == workspace_handle)
             || should_be_sticky
         {
             // TODO: enforce focus stealing prevention by also checking the same rules as for the else case.
@@ -3113,6 +3176,7 @@ impl Shell {
                     surface,
                     seat: seat.clone(),
                     fullscreen: None,
+                    minimized: false,
                     maximized: false,
                     sticky: false,
                 });
@@ -3831,6 +3895,7 @@ impl Shell {
         let trigger = match &start_data {
             GrabStartData::Pointer(start_data) => Trigger::Pointer(start_data.button),
             GrabStartData::Touch(start_data) => Trigger::Touch(start_data.slot),
+            GrabStartData::TabletTool { tool, data } => Trigger::Tool(tool.clone(), data.trigger),
         };
         let active_hint = if config.cosmic_conf.active_hint {
             self.theme.cosmic().active_hint as u8
@@ -5044,6 +5109,13 @@ impl Shell {
         self.tiling_exceptions = layout::TilingExceptions::new(exceptions);
     }
 
+    pub fn update_workspace_assignments<'a, I>(&mut self, assignments: I)
+    where
+        I: Iterator<Item = &'a WorkspaceAssignment>,
+    {
+        self.workspace_assignments = layout::WorkspaceAssignments::new(assignments);
+    }
+
     pub fn take_presentation_feedback(
         &self,
         output: &Output,
@@ -5149,10 +5221,19 @@ pub fn check_grab_preconditions(
 
     let pointer = seat.get_pointer().unwrap();
     let touch = seat.get_touch().unwrap();
+    let tablet = seat.tablet_seat();
+    let tools = tablet.get_tools();
 
     let start_data =
         if serial.is_some_and(|serial| touch.has_grab(serial)) {
             GrabStartData::Touch(touch.grab_start_data().unwrap())
+        } else if let Some((desc, tool)) =
+            serial.and_then(|serial| tools.iter().find(|(_, tool)| tool.has_grab(serial)))
+        {
+            GrabStartData::TabletTool {
+                tool: desc.clone(),
+                data: tool.grab_start_data().unwrap(),
+            }
         } else {
             GrabStartData::Pointer(pointer.grab_start_data().unwrap_or_else(|| {
                 PointerGrabStartData {
@@ -5166,8 +5247,16 @@ pub fn check_grab_preconditions(
     if let Some(surface) = client_initiated {
         // Check that this surface has a click or touch down grab.
         if !match serial {
-            Some(serial) => pointer.has_grab(serial) || touch.has_grab(serial),
-            None => pointer.is_grabbed() | touch.is_grabbed(),
+            Some(serial) => {
+                pointer.has_grab(serial)
+                    || touch.has_grab(serial)
+                    || tools.values().any(|tool| tool.has_grab(serial))
+            }
+            None => {
+                pointer.is_grabbed()
+                    || touch.is_grabbed()
+                    || tools.values().any(|tool| tool.is_grabbed())
+            }
         } {
             return None;
         }
