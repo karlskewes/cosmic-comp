@@ -21,7 +21,7 @@ cosmic-config = { git = "https://github.com/pop-os/libcosmic", features = [
     "calloop",
     "macro",
 ] }
-cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "160b086", default-features = false, features = [
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", default-features = false, features = [
     "server",
 ] }
 # TODO(karlskewes): Change back to default branch when merged: https://github.com/pop-os/cosmic-settings-daemon/pull/137
@@ -142,9 +142,6 @@ inherits = "release"
 
 [profile.release]
 lto = "fat"
-
-[patch."https://github.com/pop-os/cosmic-protocols"]
-cosmic-protocols = { git = "https://github.com/pop-os//cosmic-protocols", branch = "main" }
 
 [patch.crates-io]
 smithay = { git = "https://github.com/smithay/smithay.git", rev = "cf43a02" }
