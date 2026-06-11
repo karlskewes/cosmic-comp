@@ -12,7 +12,11 @@ use std::{
 use wayland_backend::server::ClientId;
 
 use crate::{
-    shell::{focus::FocusTarget, grabs::fullscreen_items, layout::tiling::PlaceholderType},
+    shell::{
+        focus::FocusTarget,
+        grabs::fullscreen_items,
+        layout::{WorkspaceAssignments, tiling::PlaceholderType},
+    },
     wayland::{
         handlers::data_device::{self, get_dnd_icon},
         protocols::workspace::{State as WState, WorkspaceCapabilities},
@@ -25,7 +29,10 @@ use cosmic_comp_config::{
 use cosmic_config::ConfigSet;
 use cosmic_protocols::workspace::v2::server::zcosmic_workspace_handle_v2::TilingState;
 use cosmic_settings_config::shortcuts::action::{Direction, FocusDirection, ResizeDirection};
-use cosmic_settings_config::{shortcuts, window_rules::ApplicationException};
+use cosmic_settings_config::{
+    shortcuts,
+    window_rules::{ApplicationException, WorkspaceAssignment},
+};
 use keyframe::{ease, functions::EaseInOutCubic};
 use smithay::{
     backend::{input::TouchSlot, renderer::element::RenderElementStates},
@@ -50,16 +57,20 @@ use smithay::{
     },
     utils::{IsAlive, Logical, Point, Rectangle, Serial, Size},
     wayland::{
-        compositor::{SurfaceAttributes, with_states},
+        compositor::{SurfaceAttributes, get_parent, with_states},
         seat::WaylandFocus,
         session_lock::LockSurface,
-        shell::wlr_layer::{KeyboardInteractivity, Layer, LayerSurfaceCachedState},
+        shell::{
+            wlr_layer::{KeyboardInteractivity, Layer, LayerSurfaceCachedState},
+            xdg::{XDG_POPUP_ROLE, XdgPopupSurfaceData},
+        },
         xdg_activation::XdgActivationState,
         xwayland_keyboard_grab::XWaylandKeyboardGrab,
     },
     xwayland::X11Surface,
 };
 use tracing::error;
+use tracing::warn;
 
 use crate::{
     backend::render::animations::spring::{Spring, SpringParams},
@@ -290,7 +301,7 @@ pub struct Shell {
     zoom_state: Option<ZoomState>,
     appearance_conf: AppearanceConfig,
     tiling_exceptions: TilingExceptions,
-
+    workspace_assignments: WorkspaceAssignments,
     #[cfg(feature = "debug")]
     pub debug_active: bool,
 }
@@ -733,6 +744,78 @@ impl WorkspaceSet {
         self.workspaces = doesnt;
         self.post_remove_workspace(workspace_state, &previous_active_handle);
         prefers
+    }
+
+    pub fn surface_geometry_offset_from_toplevel(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<(Rectangle<i32, Local>, Point<i32, Logical>)> {
+        let mut root = surface.clone();
+
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+
+        while smithay::wayland::compositor::get_role(&root) == Some(XDG_POPUP_ROLE) {
+            let parent = with_states(&root, |states| {
+                states
+                    .data_map
+                    .get::<XdgPopupSurfaceData>()
+                    .and_then(|m| m.lock().unwrap().parent.as_ref().cloned())
+            });
+            if let Some(parent) = parent {
+                root = parent;
+            } else {
+                break;
+            }
+        }
+
+        self.sticky_layer
+            .mapped()
+            .find(|w| {
+                w.windows()
+                    .any(|(w, _)| w.wl_surface().as_deref() == Some(&root))
+            })
+            .and_then(|w| {
+                self.sticky_layer
+                    .element_geometry(w)
+                    .zip(w.surface_offset(surface))
+            })
+            .or_else(|| {
+                self.workspaces.iter().find_map(|workspace| {
+                    workspace
+                        .get_fullscreen_surfaces()
+                        .find_map(|fs| {
+                            (fs.surface.wl_surface().as_deref() == Some(&root))
+                                .then(|| {
+                                    fs.surface.surface_offset(surface).map(|offset| {
+                                        (workspace.fullscreen_geometry_for(fs), offset)
+                                    })
+                                })
+                                .flatten()
+                        })
+                        .or_else(|| {
+                            workspace.mapped().find_map(|w| {
+                                w.windows()
+                                    .any(|(w, _)| w.wl_surface().as_deref() == Some(&root))
+                                    .then(|| {
+                                        workspace.element_geometry(w).zip(w.surface_offset(surface))
+                                    })
+                                    .flatten()
+                            })
+                        })
+                })
+            })
+            .or_else(|| {
+                layer_map_for_output(&self.output).layers().find_map(|l| {
+                    (l.wl_surface() == &root)
+                        .then(|| {
+                            CosmicSurface::surface_tree_offset(l.wl_surface(), surface)
+                                .map(|offset| (l.geometry().as_local(), offset))
+                        })
+                        .flatten()
+                })
+            })
     }
 }
 
@@ -1568,12 +1651,13 @@ impl Common {
             if let Some(mapped) = shell.element_for_surface(surface) {
                 mapped.on_commit(surface);
             }
-            if let Some(surface) = shell
+            if let Some(fs) = shell
                 .workspaces
                 .spaces()
-                .find_map(|w| w.get_fullscreen().filter(|s| *s == surface))
+                .flat_map(|w| w.get_fullscreen_surfaces())
+                .find(|f| f.surface == *surface)
             {
-                surface.on_commit()
+                fs.surface.on_commit()
             };
         }
         self.popups.commit(surface);
@@ -1585,6 +1669,9 @@ impl Shell {
         let theme = cosmic::theme::system_preference();
 
         let tiling_exceptions = layout::TilingExceptions::new(config.tiling_exceptions.iter());
+
+        let workspace_assignments =
+            layout::WorkspaceAssignments::new(config.workspace_assignments.iter());
 
         Shell {
             workspaces: Workspaces::new(config, theme.clone()),
@@ -1608,6 +1695,7 @@ impl Shell {
             appearance_conf: config.cosmic_conf.appearance_settings,
             zoom_state: None,
             tiling_exceptions,
+            workspace_assignments,
 
             #[cfg(feature = "debug")]
             debug_active: false,
@@ -1834,7 +1922,9 @@ impl Shell {
                 .outputs()
                 .find(|output| {
                     let workspace = self.active_space(output).unwrap();
-                    workspace.get_fullscreen() == Some(&elem)
+                    workspace
+                        .get_fullscreen_surfaces()
+                        .any(|f| f.surface == elem)
                 })
                 .cloned(),
             KeyboardFocusTarget::Group(WindowGroup { node, .. }) => self
@@ -1967,8 +2057,8 @@ impl Shell {
                     let workspace = self.active_space(o).unwrap();
 
                     workspace
-                        .get_fullscreen()
-                        .is_some_and(|s| s.has_surface(surface, WindowSurfaceType::ALL))
+                        .get_fullscreen_surfaces()
+                        .any(|f| f.surface.has_surface(surface, WindowSurfaceType::ALL))
                         || workspace
                             .mapped()
                             .any(|e| e.has_surface(surface, WindowSurfaceType::ALL))
@@ -2023,8 +2113,8 @@ impl Shell {
                 .workspaces
                 .spaces()
                 .find(|w| {
-                    w.get_fullscreen()
-                        .is_some_and(|s| s.has_surface(surface, WindowSurfaceType::ALL))
+                    w.get_fullscreen_surfaces()
+                        .any(|f| f.surface.has_surface(surface, WindowSurfaceType::ALL))
                         || w.mapped()
                             .any(|e| e.has_surface(surface, WindowSurfaceType::ALL))
                         || w.minimized_windows.iter().any(|m| {
@@ -2071,7 +2161,7 @@ impl Shell {
                     .mapped()
                     .any(|m| m.windows().any(|(s, _)| &s == surface))
                 || set.workspaces.iter().any(|w| {
-                    w.get_fullscreen().is_some_and(|s| s == surface)
+                    w.get_fullscreen_surfaces().any(|f| &f.surface == surface)
                         || w.minimized_windows
                             .iter()
                             .any(|m| m.windows().any(|s| &s == surface))
@@ -2707,10 +2797,32 @@ impl Shell {
         };
 
         let pending_activation = self.pending_activations.remove(&(&window).into());
-        let workspace_handle = match pending_activation {
+        let mut workspace_handle = match pending_activation {
             Some(ActivationContext::Workspace(handle)) => Some(handle),
             _ => None,
         };
+
+        let pinned_workspace_id =
+            layout::get_workspace_assignment(&self.workspace_assignments, &window);
+
+        let pinned_workspace_handle = pinned_workspace_id //
+            .as_deref()
+            .and_then(|target_id| {
+                self.workspaces
+                    .spaces()
+                    .find(|ws| ws.id.as_deref() == Some(target_id))
+                    .map(|ws| ws.handle)
+            });
+
+        if let Some(id) = pinned_workspace_id
+            && pinned_workspace_handle.is_none()
+        {
+            warn!("Assigned workspace id not found: {}", id);
+        };
+
+        // override the pending activation handle if we have a matching pinned workspace.
+        // NOTE: if the pinned workspace is not active, it will not be made active.
+        workspace_handle = pinned_workspace_handle.or(workspace_handle);
 
         let should_be_fullscreen = output.is_some();
         let mut output = output.unwrap_or_else(|| seat.active_output());
@@ -2760,12 +2872,7 @@ impl Shell {
         let floating_exception = layout::has_floating_exception(&self.tiling_exceptions, &window);
 
         if should_be_fullscreen {
-            if let Some((surface, state, _)) = workspace.map_fullscreen(&window, &seat, None, None)
-            {
-                toplevel_leave_output(&surface, &workspace.output);
-                toplevel_leave_workspace(&surface, &workspace.handle);
-                self.remap_unfullscreened_window(surface, state, loop_handle);
-            }
+            workspace.map_fullscreen(&window, &seat, None, None);
             if was_activated {
                 workspace_state.add_workspace_state(&workspace_handle, WState::Urgent);
             }
@@ -3136,9 +3243,12 @@ impl Shell {
         let from_workspace = self.workspaces.space_for_handle_mut(from).unwrap(); // checked above
 
         let is_minimized = window.is_minimized();
-        let is_fullscreen = from_workspace.get_fullscreen().is_some_and(|f| f == window);
+        let is_fullscreen = from_workspace
+            .get_fullscreen_surfaces()
+            .any(|f| &f.surface == window);
         let mut window_state = if is_fullscreen {
-            let (_, previous_state, previous_geometry) = from_workspace.take_fullscreen().unwrap();
+            let (_, previous_state, previous_geometry) =
+                from_workspace.take_fullscreen(window).unwrap();
             WorkspaceRestoreData::Fullscreen(previous_state.zip(previous_geometry).map(
                 |(previous_state, previous_geometry)| FullscreenRestoreData {
                     previous_state,
@@ -3294,14 +3404,12 @@ impl Shell {
                 );
                 mapped.into()
             } else if let WorkspaceRestoreData::Fullscreen(previous) = window_state {
-                if let Some((old_surface, previous_state, _)) = to_workspace.map_fullscreen(
+                to_workspace.map_fullscreen(
                     window,
                     None,
                     previous.clone().map(|p| p.previous_state),
                     previous.map(|p| p.previous_geometry),
-                ) {
-                    self.remap_unfullscreened_window(old_surface, previous_state, evlh);
-                }
+                );
                 window.clone().into()
             } else {
                 unreachable!() // TODO: sticky
@@ -3519,8 +3627,12 @@ impl Shell {
         } else if let Some((workspace, output)) = self.workspace_for_surface(surface) {
             let workspace = self.workspaces.space_for_handle(&workspace).unwrap();
 
-            if let Some(window) = workspace.get_fullscreen().filter(|s| *s == surface) {
-                let global_position = (workspace.fullscreen_geometry().unwrap().loc
+            if let Some(fs) = workspace
+                .get_fullscreen_surfaces()
+                .find(|f| &f.surface == surface)
+            {
+                let window = &fs.surface;
+                let global_position = (workspace.fullscreen_geometry_for(fs).loc
                     + location.as_local())
                 .to_global(&output);
 
@@ -3613,10 +3725,14 @@ impl Shell {
         let maybe_fullscreen_workspace = self
             .workspaces
             .spaces_mut()
-            .find(|w| w.get_fullscreen().is_some_and(|s| s == surface));
+            .find(|w| w.get_fullscreen_surfaces().any(|f| &f.surface == surface));
         if let Some(workspace) = maybe_fullscreen_workspace {
-            element_geo = Some(workspace.fullscreen_geometry().unwrap());
-            let (surface, state, _) = workspace.remove_fullscreen().unwrap();
+            let fs = workspace
+                .get_fullscreen_surfaces()
+                .find(|f| &f.surface == surface)
+                .unwrap();
+            element_geo = Some(workspace.fullscreen_geometry_for(fs));
+            let (surface, state, _) = workspace.remove_fullscreen_surface(surface).unwrap();
             self.remap_unfullscreened_window(surface, state, evlh);
         };
 
@@ -3641,7 +3757,11 @@ impl Shell {
             if old_mapped.is_maximized(false) {
                 new_mapped.set_maximized(false);
             }
-            start_data.set_focus(new_mapped.focus_under((0., 0.).into(), WindowSurfaceType::ALL));
+            start_data.set_focus(new_mapped.focus_under(
+                (0., 0.).into(),
+                WindowSurfaceType::ALL,
+                seat,
+            ));
             new_mapped
         } else {
             old_mapped.clone()
@@ -3825,19 +3945,15 @@ impl Shell {
     /// Get the window geometry of a keyboard focus target
     pub fn focused_geometry(&self, target: &KeyboardFocusTarget) -> Option<Rectangle<i32, Global>> {
         match target {
-            KeyboardFocusTarget::Fullscreen(surface) => {
-                if let Some(workspace) = surface
-                    .wl_surface()
-                    .and_then(|s| self.workspace_for_surface(&s))
-                    .and_then(|(handle, _)| self.workspaces.space_for_handle(&handle))
-                {
+            KeyboardFocusTarget::Fullscreen(surface) => surface
+                .wl_surface()
+                .and_then(|s| self.workspace_for_surface(&s))
+                .and_then(|(handle, _)| self.workspaces.space_for_handle(&handle))
+                .map(|workspace| {
                     workspace
-                        .fullscreen_geometry()
-                        .map(|f| f.to_global(workspace.output()))
-                } else {
-                    None
-                }
-            }
+                        .fullscreen_geometry_for_surface(surface)
+                        .to_global(workspace.output())
+                }),
             _ => {
                 if let Some(element) = self.focused_element(target) {
                     self.element_geometry(&element)
@@ -4112,7 +4228,7 @@ impl Shell {
 
         let element_offset = (new_loc - geometry.loc).as_logical();
         let focus = mapped
-            .focus_under(element_offset.to_f64(), WindowSurfaceType::ALL)
+            .focus_under(element_offset.to_f64(), WindowSurfaceType::ALL, seat)
             .map(|(target, surface_offset)| (target, (surface_offset + element_offset.to_f64())));
         start_data.set_location(new_loc.as_logical().to_f64());
         start_data.set_focus(focus.clone());
@@ -4189,9 +4305,8 @@ impl Shell {
             self.workspaces.sets.values_mut().find_map(|set| {
                 set.workspaces.iter_mut().find_map(|workspace| {
                     let window = workspace
-                        .get_fullscreen()
-                        .cloned()
-                        .into_iter()
+                        .get_fullscreen_surfaces()
+                        .map(|f| f.surface.clone())
                         .chain(workspace.mapped().map(|m| m.active_window()))
                         .find(|s| s == surface);
                     window.map(|s| (workspace, s))
@@ -4691,15 +4806,16 @@ impl Shell {
         &mut self,
         surface: &S,
         output: Output,
-        loop_handle: &LoopHandle<'static, State>,
+        _loop_handle: &LoopHandle<'static, State>,
     ) -> Option<KeyboardFocusTarget>
     where
         CosmicSurface: PartialEq<S>,
     {
         let mapped = self.element_for_surface(surface).cloned()?;
+        let seat = self.seats.last_active().clone();
         let window;
 
-        let old_fullscreen = if let Some((old_output, set)) = self
+        if let Some((old_output, set)) = self
             .workspaces
             .sets
             .iter_mut()
@@ -4746,7 +4862,7 @@ impl Shell {
             let workspace = self.active_space_mut(&output).unwrap();
             workspace.map_fullscreen(
                 &window,
-                None,
+                &seat,
                 Some(FullscreenRestoreState::Sticky {
                     output: old_output,
                     state: FloatingRestoreData {
@@ -4757,7 +4873,7 @@ impl Shell {
                     },
                 }),
                 Some(from),
-            )
+            );
         } else if let Some(workspace) = self.space_for_mut(&mapped) {
             if mapped.is_minimized() {
                 // TODO: Rewrite the `MinimizedWindow` to restore to fullscreen
@@ -4783,7 +4899,7 @@ impl Shell {
 
             workspace.map_fullscreen(
                 &window,
-                None,
+                &seat,
                 match state {
                     WorkspaceRestoreData::Floating(floating_state) => {
                         floating_state.map(|state| FullscreenRestoreState::Floating {
@@ -4800,14 +4916,10 @@ impl Shell {
                     WorkspaceRestoreData::Fullscreen(_) => unreachable!(),
                 },
                 Some(from),
-            )
+            );
         } else {
             return None;
         };
-
-        if let Some((old_fullscreen, restore, _)) = old_fullscreen {
-            self.remap_unfullscreened_window(old_fullscreen, restore, loop_handle);
-        }
 
         Some(KeyboardFocusTarget::Fullscreen(window))
     }
@@ -4823,11 +4935,12 @@ impl Shell {
         let maybe_workspace = self.workspaces.iter_mut().find_map(|(_, s)| {
             s.workspaces
                 .iter_mut()
-                .find(|w| w.get_fullscreen().is_some_and(|f| f == surface))
+                .find(|w| w.get_fullscreen_surfaces().any(|f| &f.surface == surface))
         });
 
         if let Some(workspace) = maybe_workspace {
-            let (old_fullscreen, restore, _) = workspace.remove_fullscreen().unwrap();
+            let (old_fullscreen, restore, _) =
+                workspace.remove_fullscreen_surface(surface).unwrap();
             toplevel_leave_output(&old_fullscreen, &workspace.output);
             toplevel_leave_workspace(&old_fullscreen, &workspace.handle);
 
@@ -4873,6 +4986,13 @@ impl Shell {
         I: Iterator<Item = &'a ApplicationException>,
     {
         self.tiling_exceptions = layout::TilingExceptions::new(exceptions);
+    }
+
+    pub fn update_workspace_assignments<'a, I>(&mut self, assignments: I)
+    where
+        I: Iterator<Item = &'a WorkspaceAssignment>,
+    {
+        self.workspace_assignments = layout::WorkspaceAssignments::new(assignments);
     }
 
     pub fn take_presentation_feedback(
