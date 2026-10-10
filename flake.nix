@@ -55,7 +55,7 @@
 
           nativeBuildInputs = with pkgs; [
             autoPatchelfHook
-            cmake
+            just
             pkg-config
           ];
 
@@ -96,10 +96,11 @@
                 ./data
                 ./resources
                 ./src
-                ./Cargo.toml
-                ./Cargo.lock
-                ./Makefile
                 ./build.rs
+                ./cargo.just
+                ./Cargo.lock
+                ./Cargo.toml
+                ./justfile
                 ./i18n.toml
               ];
             };
@@ -109,15 +110,21 @@
               allowBuiltinFetchGit = true;
             };
 
-            dontCargoInstall = true;
+            # default recipe missing --target and --profile release already used.
+            dontUseJustBuild = true;
+            dontUseJustCheck = true; # no just test recipe.
 
             inherit (common) buildInputs nativeBuildInputs runtimeDependencies;
 
             separateDebugInfo = true;
 
-            makeFlags = [
-              "prefix=${placeholder "out"}"
-              "CARGO_TARGET_DIR=target/${common.pkgs.stdenv.hostPlatform.rust.cargoShortTarget}"
+            justFlags = [
+              "--set"
+              "prefix"
+              (placeholder "out")
+              "--set"
+              "cargo-target-dir"
+              "target/${common.pkgs.stdenv.hostPlatform.rust.cargoShortTarget}"
             ];
 
             meta = with common.pkgs.lib; {
@@ -143,6 +150,7 @@
             packages = with common.pkgs; [
               common.rustToolchain
               rust-analyzer
+              just
             ];
 
             LD_LIBRARY_PATH = common.pkgs.lib.makeLibraryPath common.runtimeDependencies;
