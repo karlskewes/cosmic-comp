@@ -39,23 +39,22 @@
           inherit pkgs rustToolchain;
 
           buildInputs = with pkgs; [
-            libdisplay-info
+            libdisplay-info_0_3
             libinput
             libgbm
             libxkbcommon
-            fontconfig
             pixman
             stdenv.cc.cc.lib
             seatd
             systemd
             udev
             wayland
-            xrdb
           ];
 
           nativeBuildInputs = with pkgs; [
             autoPatchelfHook
             just
+            makeBinaryWrapper
             pkg-config
           ];
 
@@ -67,7 +66,6 @@
             libxcursor
             libxi
             libxkbcommon
-            xrdb
             vulkan-loader
           ];
         };
@@ -116,7 +114,13 @@
 
             inherit (common) buildInputs nativeBuildInputs runtimeDependencies;
 
+            postInstall = ''
+              wrapProgram $out/bin/cosmic-comp \
+              --prefix PATH : ${common.pkgs.lib.makeBinPath [ common.pkgs.xrdb ]}
+            '';
+
             separateDebugInfo = true;
+            __structuredAttrs = true;
 
             justFlags = [
               "--set"
